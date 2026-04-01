@@ -1,0 +1,22 @@
+[Unit]
+Description=Denizen - self-hosted neighbourhood tracker
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/denizen
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/YOUR_USER/denizen/data
+
+[Install]
+WantedBy=multi-user.target
