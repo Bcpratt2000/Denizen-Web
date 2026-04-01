@@ -26,9 +26,11 @@ const App = {
     document.getElementById('app').classList.add('hidden');
   },
 
-  showApp() {
+  async showApp() {
     document.getElementById('login-overlay').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
+    // Fetch CSRF token now that we have an authenticated session
+    await API.fetchCsrfToken();
     if (!this.mapInitialized) {
       Map.init('map');
       Search.init(
@@ -161,9 +163,8 @@ const App = {
       
       document.getElementById('detail-address').textContent = n.address;
       
-      // Render markdown content
-      const content = marked.parse(n.content || '');
-      document.getElementById('detail-content').innerHTML = content;
+      // Content is pre-sanitized HTML from the server (server uses DOMPurify.sanitize)
+      document.getElementById('detail-content').innerHTML = n.content || '';
 
       // Highlight active card
       document.querySelectorAll('.neighbour-card').forEach(c => {
