@@ -350,6 +350,14 @@ const App = {
         this.renderDynamicLists();
       });
     });
+
+    // Sync residents/pets on blur so edits are preserved when switching fields
+    residentsList.querySelectorAll('input').forEach(input => {
+      input.addEventListener('blur', () => this._syncResidentsFromDOM());
+    });
+    petsList.querySelectorAll('input').forEach(input => {
+      input.addEventListener('blur', () => this._syncPetsFromDOM());
+    });
   },
 
   addResidentRow() {
