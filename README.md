@@ -91,8 +91,21 @@ Edit `.env`:
 | `AUTH_PASSWORD` | *(none)* | Password for access |
 | `SESSION_SECRET` | *(none)* | Random string for session encryption |
 | `DATA_DIR` | `./data` | Where neighbour files are stored |
+| `GEOCODE_REGION` | *(none)* | Region appended to geocode queries (e.g. `"Saratoga Springs, UT"`) |
 
 **Important:** Set `AUTH_PASSWORD` before first use — otherwise anyone can access your neighbour data.
+
+## Dependencies
+
+```toml
+# package.json (run `npm install`)
+express
+express-session
+marked
+gray-matter
+lunr
+dotenv
+```
 
 ## Backup
 
