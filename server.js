@@ -1,6 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
+const cookieParser = require('cookie-parser');
+const csrf = require('csurf');
+const rateLimit = require('express-rate-limit');
+const DOMPurify = require('isomorphic-dompurify');
+const marked = require('marked');
 const fs = require('fs');
 const path = require('path');
 const matter = require('gray-matter');
@@ -18,16 +23,46 @@ const SEARCH_INDEX_FILE = path.join(DATA_DIR, 'search-index.json');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-// Middleware
+// --- STARTUP CHECKS ---
+// 6. Fail if SESSION_SECRET is not set
+if (!process.env.SESSION_SECRET) {
+  console.error('ERROR: SESSION_SECRET environment variable is not set. Aborting startup.');
+  console.error('Set it in your .env file: SESSION_SECRET=<a-long-random-string>');
+  process.exit(1);
+}
+
+// --- MIDDLEWARE ---
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Cookie parser is required for csurf double-submit cookie pattern
+app.use(cookieParser());
+
+// Session config with secure cookie flags (issue #1)
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'denizen-secret',
+  secret: process.env.SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 24 hours
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    httpOnly: true,
+    secure: true,
+    sameSite: 'strict'
+  }
 }));
+
+// CSRF protection using double-submit cookie pattern (issue #2)
+const csrfProtection = csrf({ cookie: true });
+
+// Rate limiting on login endpoint (issue #5)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,                   // 5 attempts per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' }
+});
 
 // Auth middleware
 function requireAuth(req, res, next) {
@@ -37,7 +72,8 @@ function requireAuth(req, res, next) {
 }
 
 // --- AUTH ---
-app.post('/api/auth/login', (req, res) => {
+// POST /api/auth/login — rate limited
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { password } = req.body;
   if (password === process.env.AUTH_PASSWORD) {
     req.session.authenticated = true;
@@ -47,7 +83,7 @@ app.post('/api/auth/login', (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', csrfProtection, (req, res) => {
   req.session.destroy();
   res.json({ ok: true });
 });
@@ -56,7 +92,31 @@ app.get('/api/auth/check', (req, res) => {
   res.json({ authenticated: !!req.session.authenticated || !process.env.AUTH_PASSWORD });
 });
 
+// GET /api/auth/csrf-token — returns CSRF token for client use
+app.get('/api/auth/csrf-token', csrfProtection, (req, res) => {
+  res.json({ csrfToken: req.csrfToken() });
+});
+
 // --- HELPERS ---
+
+// Strip HTML tags from a string (used to sanitize names before embedding in markdown)
+function sanitizeName(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/<[^>]*>/g, '').trim();
+}
+
+// 4. Sanitize resident and pet name fields before embedding in markdown
+function sanitizeMarkdownString(str) {
+  if (!str || typeof str !== 'string') return '';
+  // Escape potential markdown/HTML special chars to prevent injection
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
 function slugify(str) {
   return str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 }
@@ -133,6 +193,17 @@ function buildSearchIndex() {
   return idx.toJSON();
 }
 
+// 3. Sanitize markdown — returns sanitized HTML string
+function sanitizeMarkdown(content) {
+  if (!content) return '';
+  try {
+    const html = marked.parse(content);
+    return DOMPurify.sanitize(html);
+  } catch (e) {
+    return DOMPurify.sanitize(content);
+  }
+}
+
 // --- NEIGHBOURS CRUD ---
 app.get('/api/neighbours', requireAuth, (req, res) => {
   try {
@@ -156,13 +227,15 @@ app.get('/api/neighbours/:id', requireAuth, (req, res) => {
     const filepath = path.join(NEIGHBOURS_DIR, req.params.id + '.md');
     if (!fs.existsSync(filepath)) return res.status(404).json({ error: 'Not found' });
     const n = parseNeighbourFile(filepath);
+    // 3. Sanitize markdown content before sending to client
+    n.content = sanitizeMarkdown(n.content);
     res.json(n);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/neighbours', requireAuth, (req, res) => {
+app.post('/api/neighbours', requireAuth, csrfProtection, (req, res) => {
   try {
     const { address, residents, pets, notes, coordinates, tags, dateAdded } = req.body;
     if (!address) return res.status(400).json({ error: 'Address required' });
@@ -170,18 +243,26 @@ app.post('/api/neighbours', requireAuth, (req, res) => {
     const id = slugify(address);
     const date = dateAdded || new Date().toISOString().split('T')[0];
     let content = `---\nid: ${id}\naddress: "${address}"\ncoordinates: ${JSON.stringify(coordinates || [])}\ndateAdded: ${date}\ntags:\n${(tags || []).map(t => `  - ${t}`).join('\n')}\n---\n\n# ${address}\n\n`;
-    
+
+    // 4. Sanitize resident names before embedding in markdown
     if (residents && residents.length) {
       const residentLines = residents.map(r => {
-        let line = `- **${r.role}:** ${r.name}`;
+        const safeRole = sanitizeMarkdownString(r.role || '');
+        const safeName = sanitizeMarkdownString(r.name || '');
+        let line = `- **${safeRole}:** ${safeName}`;
         if (r.phone) line += `\n  - Phone: ${r.phone}`;
         if (r.email) line += `\n  - Email: ${r.email}`;
         return line;
       });
       content += `## Residents\n${residentLines.join('\n')}\n\n`;
     }
+    // 4. Sanitize pet names before embedding in markdown
     if (pets && pets.length) {
-      content += `## Pets\n${pets.map(p => `- ${p.name} (${p.type})`).join('\n')}\n\n`;
+      content += `## Pets\n${pets.map(p => {
+        const safeName = sanitizeMarkdownString(p.name || '');
+        const safeType = sanitizeMarkdownString(p.type || 'pet');
+        return `- ${safeName} (${safeType})`;
+      }).join('\n')}\n\n`;
     }
     if (notes) {
       content += `## Notes\n${notes}\n`;
@@ -196,7 +277,7 @@ app.post('/api/neighbours', requireAuth, (req, res) => {
   }
 });
 
-app.put('/api/neighbours/:id', requireAuth, (req, res) => {
+app.put('/api/neighbours/:id', requireAuth, csrfProtection, (req, res) => {
   try {
     const { address, residents, pets, notes, coordinates, tags, dateAdded } = req.body;
     if (!address) return res.status(400).json({ error: 'Address required' });
@@ -204,18 +285,26 @@ app.put('/api/neighbours/:id', requireAuth, (req, res) => {
     const id = req.params.id;
     const date = dateAdded || new Date().toISOString().split('T')[0];
     let content = `---\nid: ${id}\naddress: "${address}"\ncoordinates: ${JSON.stringify(coordinates || [])}\ndateAdded: ${date}\ntags:\n${(tags || []).map(t => `  - ${t}`).join('\n')}\n---\n\n# ${address}\n\n`;
-    
+
+    // 4. Sanitize resident names before embedding in markdown
     if (residents && residents.length) {
       const residentLines = residents.map(r => {
-        let line = `- **${r.role}:** ${r.name}`;
+        const safeRole = sanitizeMarkdownString(r.role || '');
+        const safeName = sanitizeMarkdownString(r.name || '');
+        let line = `- **${safeRole}:** ${safeName}`;
         if (r.phone) line += `\n  - Phone: ${r.phone}`;
         if (r.email) line += `\n  - Email: ${r.email}`;
         return line;
       });
       content += `## Residents\n${residentLines.join('\n')}\n\n`;
     }
+    // 4. Sanitize pet names before embedding in markdown
     if (pets && pets.length) {
-      content += `## Pets\n${pets.map(p => `- ${p.name} (${p.type})`).join('\n')}\n\n`;
+      content += `## Pets\n${pets.map(p => {
+        const safeName = sanitizeMarkdownString(p.name || '');
+        const safeType = sanitizeMarkdownString(p.type || 'pet');
+        return `- ${safeName} (${safeType})`;
+      }).join('\n')}\n\n`;
     }
     if (notes) {
       content += `## Notes\n${notes}\n`;
@@ -230,7 +319,7 @@ app.put('/api/neighbours/:id', requireAuth, (req, res) => {
   }
 });
 
-app.delete('/api/neighbours/:id', requireAuth, (req, res) => {
+app.delete('/api/neighbours/:id', requireAuth, csrfProtection, (req, res) => {
   try {
     const filepath = path.join(NEIGHBOURS_DIR, req.params.id + '.md');
     if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
@@ -246,7 +335,7 @@ app.get('/api/search', requireAuth, (req, res) => {
   try {
     const { q } = req.query;
     if (!q) return res.json([]);
-    
+
     let index;
     if (fs.existsSync(SEARCH_INDEX_FILE)) {
       index = lunr.Index.load(JSON.parse(fs.readFileSync(SEARCH_INDEX_FILE, 'utf-8')));
@@ -254,12 +343,12 @@ app.get('/api/search', requireAuth, (req, res) => {
       rebuildSearchIndex();
       index = lunr.Index.load(JSON.parse(fs.readFileSync(SEARCH_INDEX_FILE, 'utf-8')));
     }
-    
+
     const results = index.search(q);
     const neighbours = getAllNeighbours();
     const resultMap = {};
     neighbours.forEach(n => { resultMap[n.id] = n; });
-    
+
     res.json(results.map(r => ({
       id: r.ref,
       address: resultMap[r.ref]?.address,
@@ -276,15 +365,15 @@ app.get('/api/geocode', requireAuth, async (req, res) => {
   try {
     const { address } = req.query;
     if (!address) return res.status(400).json({ error: 'Address required' });
-    
+
     const query = encodeURIComponent(address + (GEOCODE_REGION ? ', ' + GEOCODE_REGION : ''));
     const url = `https://nominatim.openstreetmap.org/search?q=${query}&format=json&limit=1`;
-    
+
     const response = await fetch(url, {
       headers: { 'User-Agent': 'NeighbourMap/1.0' }
     });
     const data = await response.json();
-    
+
     if (data && data[0]) {
       res.json({
         lat: parseFloat(data[0].lat),
@@ -304,7 +393,7 @@ function extractSummary(content) {
   let section = '';
   let residents = [];
   let pets = [];
-  
+
   lines.forEach(line => {
     if (line.startsWith('## Residents')) { section = 'residents'; }
     else if (line.startsWith('## Pets')) { section = 'pets'; }
@@ -319,7 +408,7 @@ function extractSummary(content) {
       if (match) pets.push(match[1].trim());
     }
   });
-  
+
   let summary = residents.slice(0, 3).join(', ');
   if (residents.length > 3) summary += ` +${residents.length - 3} more`;
   if (pets.length) summary += ` + ${pets.length} pet${pets.length > 1 ? 's' : ''}`;
